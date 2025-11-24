@@ -1,0 +1,266 @@
+Real-time Human Pose Estimation with Bending Alert System using YOLOv8-Pose
+Author: EC Engineering Student Project
+Description: Detects human poses and alerts when person is bending
+"""
+
+import cv2
+from ultralytics import YOLO
+import numpy as np
+import math
+import time
+import threading
+import winsound  # For Windows alert sound (use 'os' for cross-platform)
+
+# Global variable for alert control
+alert_active = False
+last_alert_time = 0
+
+def play_alert_sound():
+    """Play alert sound in a separate thread"""
+    global alert_active
+    try:
+        # Windows beep (frequency, duration in ms)
+        for _ in range(3):  # Beep 3 times
+            winsound.Beep(1000, 200)  # 1000 Hz, 200ms
+            time.sleep(0.1)
+    except:
+        # Fallback for non-Windows systems
+        print("\a" * 3)  # Terminal bell sound
+    alert_active = False
+
+def calculate_angle(p1, p2, p3):
+    """Calculate angle between three points"""
+    a = np.array(p1)
+    b = np.array(p2)
+    c = np.array(p3)
+    
+    ba = a - b
+    bc = c - b
+    
+    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    angle = np.arccos(np.clip(cosine, -1.0, 1.0))
+    
+    return np.degrees(angle)
+
+def detect_posture(keypoints):
+    """
+    Detect posture based on body keypoints with bending detection
+    YOLOv8 Keypoint indices (COCO format):
+    0: Nose, 1: Left Eye, 2: Right Eye, 3: Left Ear, 4: Right Ear
+    5: Left Shoulder, 6: Right Shoulder, 7: Left Elbow, 8: Right Elbow
+    9: Left Wrist, 10: Right Wrist, 11: Left Hip, 12: Right Hip
+    13: Left Knee, 14: Right Knee, 15: Left Ankle, 16: Right Ankle
+    """
+    
+    if keypoints is None or len(keypoints) == 0:
+        return "Unknown", (128, 128, 128), False
+    
+    # Extract keypoints with confidence check
+    kp = keypoints[0]  # First person
+    
+    # Check if enough keypoints are detected
+    nose = kp[0][:2] if kp[0][2] > 0.5 else None
+    l_shoulder = kp[5][:2] if kp[5][2] > 0.5 else None
+    r_shoulder = kp[6][:2] if kp[6][2] > 0.5 else None
+    l_hip = kp[11][:2] if kp[11][2] > 0.5 else None
+    r_hip = kp[12][:2] if kp[12][2] > 0.5 else None
+    l_knee = kp[13][:2] if kp[13][2] > 0.5 else None
+    r_knee = kp[14][:2] if kp[14][2] > 0.5 else None
+    l_ankle = kp[15][:2] if kp[15][2] > 0.5 else None
+    r_ankle = kp[16][:2] if kp[16][2] > 0.5 else None
+    
+    # Check if critical keypoints are available
+    critical_points = [l_shoulder, r_shoulder, l_hip, r_hip]
+    if any(point is None for point in critical_points):
+        return "Unknown", (128, 128, 128), False
+    
+    # Calculate body orientation and angles
+    shoulder_mid = [(l_shoulder[0] + r_shoulder[0])/2, (l_shoulder[1] + r_shoulder[1])/2]
+    hip_mid = [(l_hip[0] + r_hip[0])/2, (l_hip[1] + r_hip[1])/2]
+    
+    # Body vertical difference (shoulder to hip)
+    body_vertical = abs(shoulder_mid[1] - hip_mid[1])
+    body_horizontal = abs(shoulder_mid[0] - hip_mid[0])
+    
+    # Calculate body angle from vertical
+    body_angle = math.atan2(body_horizontal, body_vertical + 1e-6)
+    body_angle_deg = math.degrees(body_angle)
+    
+    # Calculate spine angle (shoulder-hip angle relative to vertical)
+    spine_angle = None
+    if nose is not None:
+        spine_angle = calculate_angle(nose, shoulder_mid, hip_mid)
+    
+    # Calculate hip-knee angles
+    hip_knee_angle = None
+    if l_knee is not None and l_hip is not None and l_shoulder is not None:
+        hip_knee_angle = calculate_angle(l_shoulder, l_hip, l_knee)
+    elif r_knee is not None and r_hip is not None and r_shoulder is not None:
+        hip_knee_angle = calculate_angle(r_shoulder, r_hip, r_knee)
+    
+    # Flag for bending detection
+    is_bending = False
+    
+    # BENDING DETECTION: Key indicator is forward lean with bent spine
+    # Person is bending if:
+    # 1. Body is tilted forward (30-70 degrees from vertical)
+    # 2. Upper body is angled forward
+    # 3. Not fully horizontal (not sleeping)
+    # 4. Legs are relatively straight (not sitting)
+    
+    if spine_angle is not None:
+        # Spine bent forward significantly
+        if spine_angle < 140 and 25 < body_angle_deg < 70:
+            is_bending = True
+            return "BENDING", (0, 0, 255), True  # Red color for alert
+    
+    # Alternative bending detection: body angle check
+    if 30 < body_angle_deg < 65:
+        if hip_knee_angle is None or hip_knee_angle > 140:  # Legs straight
+            is_bending = True
+            return "BENDING", (0, 0, 255), True
+    
+    # SLEEPING: Body is horizontal
+    if body_angle_deg > 65:
+        return "Sleeping", (255, 0, 255), False  # Magenta
+    
+    # SITTING: Hip-knee angle is acute and body relatively upright
+    if hip_knee_angle is not None:
+        if 60 < hip_knee_angle < 120 and body_angle_deg < 30:
+            return "Sitting", (0, 165, 255), False  # Orange
+    
+    # STANDING: Body is vertical and legs are straight
+    if body_angle_deg < 25:
+        if hip_knee_angle is None or hip_knee_angle > 140:
+            return "Standing", (0, 255, 0), False  # Green
+        elif hip_knee_angle < 120:
+            return "Sitting", (0, 165, 255), False
+    
+    # Check for sitting based on vertical body compression
+    if body_vertical < 100 and body_angle_deg < 30:
+        return "Sitting", (0, 165, 255), False
+    
+    # Default to standing if upright
+    if body_angle_deg < 30:
+        return "Standing", (0, 255, 0), False
+    
+    return "Unknown", (128, 128, 128), False
+
+def main():
+    global alert_active, last_alert_time
+    
+    # Load YOLOv8-Pose pretrained model
+    print("Loading YOLO-Pose model...")
+    model = YOLO('yolov8n-pose.pt')
+    
+    # Open webcam
+    cap = cv2.VideoCapture(0)
+    
+    if not cap.isOpened():
+        print("Error: Could not open camera")
+        return
+    
+    # Set camera resolution
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    print("Camera opened successfully!")
+    print("Press 'q' to quit")
+    print("\n=== BENDING ALERT SYSTEM ACTIVE ===")
+    print("Postures detected: Standing, Sitting, Sleeping, BENDING (⚠️ Alert)")
+    
+    # Alert cooldown (seconds)
+    ALERT_COOLDOWN = 3
+    
+    while True:
+        ret, frame = cap.read()
+        
+        if not ret:
+            print("Error: Failed to capture frame")
+            break
+        
+        # Run YOLOv8 pose estimation
+        results = model(frame, conf=0.5, verbose=False)
+        
+        # Get keypoints
+        keypoints_data = results[0].keypoints.data.cpu().numpy() if results[0].keypoints is not None else None
+        
+        # Annotate frame with skeleton
+        annotated_frame = results[0].plot()
+        
+        # Flag to track if any person is bending
+        any_bending = False
+        
+        # Detect posture for each person
+        if keypoints_data is not None and len(keypoints_data) > 0:
+            for idx, kp in enumerate(keypoints_data):
+                posture, color, is_bending = detect_posture([kp])
+                
+                if is_bending:
+                    any_bending = True
+                
+                # Get bounding box for text placement
+                if results[0].boxes is not None and len(results[0].boxes) > idx:
+                    box = results[0].boxes.xyxy[idx].cpu().numpy()
+                    x1, y1, x2, y2 = map(int, box)
+                    
+                    # Display posture label
+                    label = f"Person {idx+1}: {posture}"
+                    
+                    # Background rectangle for text
+                    text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
+                    cv2.rectangle(annotated_frame, 
+                                (x1, y1 - text_size[1] - 10),
+                                (x1 + text_size[0] + 10, y1),
+                                color, -1)
+                    
+                    # Text
+                    cv2.putText(annotated_frame, label, (x1 + 5, y1 - 5),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        
+        # Trigger alert if bending detected
+        current_time = time.time()
+        if any_bending and not alert_active and (current_time - last_alert_time) > ALERT_COOLDOWN:
+            alert_active = True
+            last_alert_time = current_time
+            # Play sound in separate thread to not block video
+            threading.Thread(target=play_alert_sound, daemon=True).start()
+        
+        # Display alert banner if bending
+        if any_bending:
+            # Flashing red alert banner
+            if int(time.time() * 2) % 2 == 0:  # Blink effect
+                cv2.rectangle(annotated_frame, (0, 0), (1280, 60), (0, 0, 255), -1)
+                cv2.putText(annotated_frame, "⚠️ ALERT: DO NOT BEND! ⚠️", (320, 40),
+                          cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+        
+        # Display info
+        info_text = f"People Detected: {len(keypoints_data) if keypoints_data is not None else 0}"
+        cv2.putText(annotated_frame, info_text, (10, 80),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
+        # Legend
+        legend_y = 110
+        cv2.putText(annotated_frame, "Standing", (10, legend_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, "Sitting", (10, legend_y + 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+        cv2.putText(annotated_frame, "Sleeping", (10, legend_y + 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+        cv2.putText(annotated_frame, "BENDING ⚠️", (10, legend_y + 90),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        # Show frame
+        cv2.imshow('YOLOv8 Pose - Bending Alert System', annotated_frame)
+        
+        # Exit on 'q' key
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    # Cleanup
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Program terminated successfully")
+
+if __name__ == "__main__":
+    main()
